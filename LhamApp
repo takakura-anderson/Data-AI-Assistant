@@ -1,0 +1,283 @@
+import os
+import ast
+import re
+import json
+import io
+import time
+import pandas as pd
+import streamlit as st
+import ollama
+from dotenv import load_dotenv
+
+# Dependências para leitura avançada (com tratamento de erro caso não estejam instaladas)
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+try:
+    import docx
+except ImportError:
+    docx = None
+try:
+    import yaml
+except ImportError:
+    yaml = None
+# Gerenciamento avançado de Tokenização com Fallback Seguro
+try:
+    from transformers import AutoTokenizer
+except ImportError:
+    AutoTokenizer = None
+
+# Carrega variáveis de ambiente
+load_dotenv()
+
+# ==========================================
+# 1. CONFIGURAÇÃO DA PÁGINA
+# ==========================================
+st.set_page_config(page_title="Assistente de Dados Corporativo", page_icon="📊", layout="wide")
+
+# ==========================================
+# 2. CONFIGURAÇÕES E PROMPTS DOS ESPECIALISTAS
+# ==========================================
+PROMPTS_ESPECIALISTAS = {
+    "Assistente Técnico": """
+Você é um assistente técnico geral.
+
+Ajude em assuntos relacionados a:
+- programação;
+- banco de dados;
+- infraestrutura;
+- documentação;
+- arquitetura of software;
+- DevOps;
+- análise de dados.
+
+Quando houver um especialista mais adequado, informe essa possibilidade ao usuário.
+""",
+
+    "SQL & Bancos de Dados": """
+Você é um Arquiteto de Banco de Dados Sênior.
+
+Especialista em:
+- SQL ANSI
+- MySQL
+- PostgreSQL
+- MariaDB
+- AWS Redshift
+- DuckDB
+
+Seu papel é:
+- criar consultas SQL eficientes;
+- otimizar performance;
+- explicar JOINs, CTEs, Views e Window Functions;
+- sugerir índices quando apropriado;
+- analisar planos de execução;
+- converter consultas entre diferentes SGBDs quando necessário.
+
+Nunca invente tabelas.
+
+Caso o usuário não forneça o esquema do banco, solicite as tabelas ou utilize apenas exemplos genéricos.
+""",
+
+    "Python & Engenharia de Dados": """
+Você é um Engenheiro de Dados e Cientista de Dados especialista em Python.
+
+Domina:
+- Python
+- Pandas
+- Polars
+- DuckDB
+- SQLAlchemy
+- ETL
+- limpeza de dados
+- automação
+- manipulação de arquivos
+- APIs
+- análise exploratória
+
+Escreva código limpo, eficiente, comentado e seguindo boas práticas.
+
+Sempre priorize desempenho e legibilidade.
+""",
+
+    "Power BI": """
+Você é um Consultor Sênior em Power BI.
+
+Especialista em:
+- DAX
+- Power Query (M)
+- modelagem estrela;
+- relacionamentos;
+- otimização de medidas;
+- performance;
+- visualizações;
+- boas práticas de modelagem;
+- integração com SQL e DuckDB.
+
+Sempre explique a lógica utilizada nas medidas.
+Quando possível, proponha alternativas mais simples e performáticas.
+"""
+}
+
+# Matriz de Afinidade: Vincula o especialista ao seu modelo ideal local
+MAPEAMENTO_ESPECIALISTAS_MODELOS = {
+    "Assistente Técnico": "phi4-mini",
+    "SQL & Bancos de Dados": "qwen2.5-coder:3b",
+    "Python & Engenharia de Dados": "gemma2:4b",
+    "Power BI": "gemma2:4b"
+}
+
+JANELA_CONTEXTO_PADRAO = 8192
+ORCAMENTO_CONTEXTO_MAXIMO = 7000
+
+# ==========================================
+# GESTÃO DINÂMICA DE TOKENIZAÇÃO (MULTIMODELO)
+# ==========================================
+class TokenizerManager:
+    """Gerenciador central de tokenizadores com mapeamento fluído de famílias de modelos."""
+    
+    # Repositórios de referência estáveis do Hugging Face para cada arquitetura utilizada
+    REPOSITORIOS = {
+        "qwen": "Qwen/Qwen2.5-Coder-3B-Instruct",
+        "gemma": "google/gemma-2-9b-it",
+        "phi": "microsoft/Phi-4-mini-instruct"
+    }
+
+    @staticmethod
+    @st.cache_resource
+    def carregar_tokenizer(repo_id):
+        """Efetua a carga isolada e cacheada do arquivo de mapeamento vocabular."""
+        if AutoTokenizer is not None:
+            try:
+                return AutoTokenizer.from_pretrained(repo_id)
+            except Exception:
+                return None
+        return None
+
+    @classmethod
+    def obter_por_modelo(cls, nome_modelo):
+        """Varre o identificador do modelo ativo e resolve o tokenizer compatível."""
+        if not nome_modelo:
+            return None
+        
+        modelo_lower = nome_modelo.lower()
+        for chave, repo in cls.REPOSITORIOS.items():
+            if chave in modelo_lower:
+                return cls.carregar_tokenizer(repo)
+        return None
+
+
+def contar_tokens(texto, nome_modelo=None):
+    """Conta os tokens reais adaptando-se dinamicamente à arquitetura de LLM ativa."""
+    if not texto:
+        return 0
+        
+    # Resolução automática de contexto se o modelo omitido for o ativo na sessão
+    if nome_modelo is None and "modelo_ia_ativo" in st.session_state:
+        nome_modelo = st.session_state.modelo_ia_ativo
+        
+    tokenizer = TokenizerManager.obter_por_modelo(nome_modelo)
+    if tokenizer:
+        try:
+            return len(tokenizer.encode(texto))
+        except Exception:
+            pass
+            
+    # Fallback numérico seguro caso o ambiente esteja estritamente offline sem cache prévio
+    return len(texto) // 4
+
+def construir_prompt_sistema_completo(system_prompt_base, contexto_arquivo):
+    """Encapsula a lógica de junção do System Prompt com os metadados dos arquivos injetados."""
+    prompt_completo = system_prompt_base
+    if contexto_arquivo:
+        prompt_completo += "\n\n" + contexto_arquivo
+    return prompt_completo
+
+def calcular_tokens_historico(mensagens, nome_modelo=None):
+    """Soma os tokens contidos unicamente no histórico linear de mensagens usando o modelo ativo."""
+    return sum(contar_tokens(m["content"], nome_modelo) for m in mensagens)
+
+def selecionar_contexto_por_tokens(mensagens, system_prompt_completo, max_tokens=ORCAMENTO_CONTEXTO_MAXIMO):
+    """
+    Varre o histórico de trás para frente e seleciona as mensagens mais recentes 
+    que respeitam o teto do orçamento definido, garantindo margem estável para a resposta.
+    """
+    nome_modelo = st.session_state.get("modelo_ia_ativo")
+    tokens_base = contar_tokens(system_prompt_completo, nome_modelo)
+    tokens_acumulados = tokens_base
+    contexto_selecionado = []
+    
+    for msg in reversed(mensagens):
+        tokens_msg = contar_tokens(msg["content"], nome_modelo)
+        if tokens_acumulados + tokens_msg > max_tokens:
+            registrar_log(f"Janela Deslizante: Mensagens antigas cortadas para preservar limite de {max_tokens} tokens.")
+            break
+        contexto_selecionado.insert(0, msg)
+        tokens_acumulados += tokens_msg
+        
+    return contexto_selecionado, tokens_acumulados
+
+def obter_estatisticas_contexto(mensagens, system_prompt_base, contexto_arquivo, max_contexto=JANELA_CONTEXTO_PADRAO):
+    """
+    Calcula as métricas unificadas de consumo do histórico total e de simulação 
+    do que seria enviado ao modelo na janela deslizante atual.
+    """
+    nome_modelo = st.session_state.get("modelo_ia_ativo")
+    prompt_completo = construir_prompt_sistema_completo(system_prompt_base, contexto_arquivo)
+    tokens_base = contar_tokens(prompt_completo, nome_modelo)
+    tokens_hist = calcular_tokens_historico(mensagens, nome_modelo)
+    
+    # Simulação da Janela Deslizante adaptada ao modelo ativo
+    _, tokens_enviados = selecionar_contexto_por_tokens(mensagens, prompt_completo, ORCAMENTO_CONTEXTO_MAXIMO)
+    
+    pct_uso = (tokens_enviados / max_contexto) if max_contexto > 0 else 0.0
+    
+    return {
+        "tokens_historico_total": tokens_base + tokens_hist,
+        "tokens_contexto_enviado": tokens_enviados,
+        "percentual_contexto": min(pct_uso, 1.0),
+        "janela_contexto": max_contexto
+    }
+
+def atualizar_metricas_contexto(mensagens, system_prompt_base, contexto_arquivo):
+    """Varre a composição de inputs e sincroniza os dados calculados de contexto no Session State."""
+    estatisticas = obter_estatisticas_contexto(mensagens, system_prompt_base, contexto_arquivo, JANELA_CONTEXTO_PADRAO)
+    st.session_state.tokens_historico = `estatisticas["tokens_historico_total"]`
+    st.session_state.tokens_contexto_enviado = `estatisticas["tokens_contexto_enviado"]`
+    st.session_state.percentual_contexto = `estatisticas["percentual_contexto"]`
+    st.session_state.janela_contexto = `estatisticas["janela_contexto"]`
+
+def estimar_tokens_totais(mensagens, system_prompt):
+    """Calcula o volume total de tokens acumulados no chat atual (Mantida para compatibilidade)."""
+    nome_modelo = st.session_state.get("modelo_ia_ativo")
+    texto_completo = system_prompt
+    for m in mensagens:
+        texto_completo += m["content"]
+    return contar_tokens(texto_completo, nome_modelo)
+
+# ==========================================
+# 3. FÁBRICA DE EXTRATORES DE CONHECIMENTO (LEITORES)
+# ==========================================
+def processar_tabular(arquivo, extensao):
+    if extensao == '.csv': df = pd.read_csv(arquivo)
+    elif extensao == '.parquet': df = pd.read_parquet(arquivo)
+    else: df = pd.read_excel(arquivo)
+    
+    buffer = io.StringIO()
+    df.info(buf=buffer)
+    info_str = buffer.getvalue()
+    
+    resumo = f"- **Linhas:** {df.shape[0]} | **Colunas:** {df.shape[1]}\n"
+    resumo += f"- **Nulos totais:** {df.isnull().sum().sum()} | **Duplicados:** {df.duplicated().sum()}\n\n"
+    resumo += f"**Info de Memória e Tipos:**\n{info_str}\n\n"
+    resumo += f"**Estatísticas (Describe):**\n{df.describe().to_string()}\n\n"
+    resumo += f"**Amostra (Primeiras linhas):**\n{df.head(3).to_string()}"
+    return resumo
+
+def processar_pdf(arquivo, extensao):
+    if not PdfReader: return "Erro: Biblioteca 'pypdf' não instalada."
+    reader = PdfReader(arquivo)
+    num_paginas = len(reader.pages)
+    texto = ""
+    for i in range(min(5, num_paginas)):
+        texto += reader.pages
