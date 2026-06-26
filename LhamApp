@@ -48,7 +48,7 @@ Ajude em assuntos relacionados a:
 - banco de dados;
 - infraestrutura;
 - documentação;
-- arquitetura of software;
+- arquitetura de software;
 - DevOps;
 - análise de dados.
 
@@ -172,7 +172,6 @@ def contar_tokens(texto, nome_modelo=None):
     if not texto:
         return 0
         
-    # Resolução automática de contexto se o modelo omitido for o ativo na sessão
     if nome_modelo is None and "modelo_ia_ativo" in st.session_state:
         nome_modelo = st.session_state.modelo_ia_ativo
         
@@ -183,7 +182,6 @@ def contar_tokens(texto, nome_modelo=None):
         except Exception:
             pass
             
-    # Fallback numérico seguro caso o ambiente esteja estritamente offline sem cache prévio
     return len(texto) // 4
 
 def construir_prompt_sistema_completo(system_prompt_base, contexto_arquivo):
@@ -227,9 +225,7 @@ def obter_estatisticas_contexto(mensagens, system_prompt_base, contexto_arquivo,
     tokens_base = contar_tokens(prompt_completo, nome_modelo)
     tokens_hist = calcular_tokens_historico(mensagens, nome_modelo)
     
-    # Simulação da Janela Deslizante adaptada ao modelo ativo
     _, tokens_enviados = selecionar_contexto_por_tokens(mensagens, prompt_completo, ORCAMENTO_CONTEXTO_MAXIMO)
-    
     pct_uso = (tokens_enviados / max_contexto) if max_contexto > 0 else 0.0
     
     return {
@@ -242,10 +238,10 @@ def obter_estatisticas_contexto(mensagens, system_prompt_base, contexto_arquivo,
 def atualizar_metricas_contexto(mensagens, system_prompt_base, contexto_arquivo):
     """Varre a composição de inputs e sincroniza os dados calculados de contexto no Session State."""
     estatisticas = obter_estatisticas_contexto(mensagens, system_prompt_base, contexto_arquivo, JANELA_CONTEXTO_PADRAO)
-    st.session_state.tokens_historico = `estatisticas["tokens_historico_total"]`
-    st.session_state.tokens_contexto_enviado = `estatisticas["tokens_contexto_enviado"]`
-    st.session_state.percentual_contexto = `estatisticas["percentual_contexto"]`
-    st.session_state.janela_contexto = `estatisticas["janela_contexto"]`
+    st.session_state.tokens_historico = estatisticas["tokens_historico_total"]
+    st.session_state.tokens_contexto_enviado = estatisticas["tokens_contexto_enviado"]
+    st.session_state.percentual_contexto = estatisticas["percentual_contexto"]
+    st.session_state.janela_contexto = estatisticas["janela_contexto"]
 
 def estimar_tokens_totais(mensagens, system_prompt):
     """Calcula o volume total de tokens acumulados no chat atual (Mantida para compatibilidade)."""
@@ -280,4 +276,346 @@ def processar_pdf(arquivo, extensao):
     num_paginas = len(reader.pages)
     texto = ""
     for i in range(min(5, num_paginas)):
-        texto += reader.pages
+        texto += reader.pages[i].extract_text() + "\n"
+    resumo = f"- **Total de Páginas:** {num_paginas}\n\n"
+    resumo += f"**Amostra do Texto Inicial:**\n{texto[:2500]}..."
+    return resumo
+
+def processar_docx(arquivo, extensao):
+    if not docx: return "Erro: Biblioteca 'python-docx' não instalada."
+    doc = docx.Document(arquivo)
+    texto = "\n".join([p.text for p in doc.paragraphs if p.text.strip() != ""])
+    resumo = f"- **Total de Parágrafos válidos:** {len(doc.paragraphs)}\n\n"
+    resumo += f"**Amostra do Texto Inicial:**\n{texto[:2500]}..."
+    return resumo
+
+def processar_texto(arquivo, extensao):
+    conteudo = arquivo.read().decode('utf-8', errors='ignore')
+    linhas = len(conteudo.splitlines())
+    palavras = len(conteudo.split())
+    resumo = f"- **Total de Linhas:** {linhas} | **Total de Palavras:** {palavras}\n\n"
+    resumo += f"**Amostra do Texto:**\n{conteudo[:2500]}..."
+    return resumo
+
+def processar_python(arquivo, extensao):
+    conteudo = arquivo.read().decode('utf-8', errors='ignore')
+    linhas = len(conteudo.splitlines())
+    resumo = f"- **Total de Linhas:** {linhas}\n"
+    try:
+        tree = ast.parse(conteudo)
+        classes = [n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
+        funcoes = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+        imports = [n.names[0].name for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))]
+        
+        resumo += f"- **Imports detectados:** {', '.join(imports)}\n"
+        resumo += f"- **Classes detectadas:** {', '.join(classes) if classes else 'Nenhuma'}\n"
+        resumo += f"- **Funções detectadas:** {', '.join(funcoes) if funcoes else 'Nenhuma'}\n\n"
+    except SyntaxError:
+        resumo += "*(Nota: O arquivo possui erros de sintaxe ou é um fragmento de código).*\n\n"
+    resumo += f"**Amostra do Código:**\n{conteudo[:2000]}..."
+    return resumo
+
+def processar_sql(arquivo, extensao):
+    conteudo = arquivo.read().decode('utf-8', errors='ignore')
+    tabelas = set(re.findall(r'(?:FROM|JOIN)\s+([a-zA-Z0-9_.]+)', conteudo, re.IGNORECASE))
+    ctes = len(re.findall(r'\bWITH\b', conteudo, re.IGNORECASE))
+    resumo = f"- **Tabelas Referenciadas:** {', '.join(tabelas) if tabelas else 'Não detectadas/Uso de alias'}\n"
+    resumo += f"- **CTEs (WITH) detectadas:** {ctes}\n\n"
+    resumo += f"**Amostra da Consulta:**\n{conteudo[:2000]}..."
+    return resumo
+
+def processar_estruturado(arquivo, extensao):
+    conteudo = arquivo.read().decode('utf-8', errors='ignore')
+    resumo = ""
+    try:
+        if extensao == '.json':
+            dados = json.loads(conteudo)
+            chaves = list(dados.keys()) if isinstance(dados, dict) else "Estrutura de Lista/Array"
+            resumo = f"- **Formato:** JSON | **Chaves Principais:** {chaves}\n\n"
+        elif extensao in ['.yaml', '.yml']:
+            dados = yaml.safe_load(conteudo) if yaml else None
+            chaves = list(dados.keys()) if isinstance(dados, dict) else "Estrutura Base"
+            resumo = f"- **Formato:** YAML | **Chaves Principais:** {chaves}\n\n"
+        elif extensao == '.xml':
+            resumo = f"- **Formato:** XML\n\n"
+    except Exception as e:
+        resumo = f"- *(Aviso: Não foi possível realizar o parse estrutural perfeito: {e})*\n\n"
+        
+    resumo += f"**Amostra do Conteúdo:**\n{conteudo[:2000]}..."
+    return resumo
+
+PROCESSADORES_ARQUIVO = {
+    '.csv': processar_tabular, '.xlsx': processar_tabular, '.xls': processar_tabular, '.parquet': processar_tabular,
+    '.pdf': processar_pdf,
+    '.docx': processar_docx,
+    '.txt': processar_texto, '.md': processar_texto,
+    '.py': processar_python,
+    '.sql': processar_sql,
+    '.json': processar_estruturado, '.xml': processar_estruturado, '.yaml': processar_estruturado, '.yml': processar_estruturado
+}
+
+# ==========================================
+# 4. INICIALIZAÇÃO SEGURA DO ESTADO DE SESSÃO
+# ==========================================
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "logs" not in st.session_state:
+    st.session_state.logs = []
+if "exibir_logs" not in st.session_state:
+    st.session_state.exibir_logs = False
+if "contexto_arquivo" not in st.session_state:
+    st.session_state.contexto_arquivo = ""
+
+if "tokens_historico" not in st.session_state:
+    st.session_state.tokens_historico = 0
+if "tokens_contexto_enviado" not in st.session_state:
+    st.session_state.tokens_contexto_enviado = 0
+if "percentual_contexto" not in st.session_state:
+    st.session_state.percentual_contexto = 0.0
+if "janela_contexto" not in st.session_state:
+    st.session_state.janela_contexto = JANELA_CONTEXTO_PADRAO
+if "ultimo_modelo" not in st.session_state:
+    st.session_state.ultimo_modelo = "N/A"
+if "ultima_velocidade" not in st.session_state:
+    st.session_state.ultima_velocidade = 0.0
+if "ultimo_tempo_total" not in st.session_state:
+    st.session_state.ultimo_tempo_total = 0.0
+
+def registrar_log(mensagem):
+    st.session_state.logs.append(mensagem)
+
+def atualizar_modelo_por_especialista():
+    esp = st.session_state.perfil_especialista
+    if esp in MAPEAMENTO_ESPECIALISTAS_MODELOS:
+        st.session_state.modelo_ia_ativo = MAPEAMENTO_ESPECIALISTAS_MODELOS[esp]
+
+# ==========================================
+# 5. BARRA LATERAL (PAINEL DE CONTROLE + ARQUIVOS)
+# ==========================================
+with st.sidebar:
+    st.header("⚙️ Painel de Controle")
+    
+    especialista_selecionado = st.selectbox(
+        "Perfil do Especialista:", 
+        options=list(PROMPTS_ESPECIALISTAS.keys()),
+        key="perfil_especialista",
+        on_change=atualizar_modelo_por_especialista
+    )
+    system_prompt_atual = PROMPTS_ESPECIALISTAS[especialista_selecionado]
+
+    try:
+        modelos_disponiveis = [m["model"] for m in ollama.list()["models"]]
+        
+        if "modelo_ia_ativo" not in st.session_state:
+            st.session_state.modelo_ia_ativo = MAPEAMENTO_ESPECIALISTAS_MODELOS.get(
+                especialista_selecionado, 
+                modelos_disponiveis[0] if modelos_disponiveis else "qwen2.5-coder:3b"
+            )
+        
+        modelo_selecionado = st.selectbox(
+            "Modelo de IA:", 
+            options=modelos_disponiveis, 
+            key="modelo_ia_ativo"
+        )
+            
+    except Exception:
+        st.error("Erro ao listar modelos. O Ollama está rodando?")
+        modelo_selecionado = None
+    
+    atualizar_metricas_contexto(st.session_state.messages, system_prompt_atual, st.session_state.contexto_arquivo)
+    
+    st.markdown("---")
+    st.subheader("💾 Consumo de Contexto")
+    
+    st.markdown(f"**Histórico Total**\n{st.session_state.tokens_historico:,} tokens")
+    st.markdown(f"**Contexto Enviado**\n{st.session_state.tokens_contexto_enviado:,} / {st.session_state.janela_contexto:,}")
+    st.markdown(f"**Uso do Contexto**\n{int(st.session_state.percentual_contexto * 100)}%")
+    
+    st.progress(st.session_state.percentual_contexto)
+    
+    st.markdown(f"**Modelo**\n`{st.session_state.ultimo_modelo}`")
+    st.markdown(f"**Velocidade**\n{st.session_state.ultima_velocidade:.1f} tokens/s")
+    st.markdown(f"**Tempo**\n{st.session_state.ultimo_tempo_total:.2f} s")
+    
+    if st.session_state.tokens_contexto_enviado > 6500:
+        st.warning("⚠️ Memória de contexto cheia. Considere limpar o histórico.")
+
+    st.markdown("---")
+    st.subheader("📂 Ingestão de Conhecimento")
+    
+    tipos_suportados = [ext.replace('.', '') for ext in PROCESSADORES_ARQUIVO.keys()]
+    arquivo_carregado = st.file_uploader("Carregue um arquivo para análise:", type=tipos_suportados)
+    
+    if arquivo_carregado is not None:
+        try:
+            nome_arquivo = arquivo_carregado.name
+            extensao = os.path.splitext(nome_arquivo)[1].lower()
+            processador = PROCESSADORES_ARQUIVO.get(extensao)
+            if processador:
+                resumo_inteligente = processador(arquivo_carregado, extensao)
+                st.session_state.contexto_arquivo = f"""
+                [CONHECIMENTO EXTRAÍDO DO ARQUIVO]
+                Nome do Arquivo: {nome_arquivo}
+                
+                {resumo_inteligente}
+                -----------------------------------
+                Instrução: Utilize essas informações estruturais e estatísticas como contexto base para responder às perguntas do usuário.
+                """
+                st.success(f"✔️ Conhecimento de {nome_arquivo} extraído!")
+                registrar_log(f"Arquivo {nome_arquivo} analisado via processador {processador.__name__}.")
+                atualizar_metricas_contexto(st.session_state.messages, system_prompt_atual, st.session_state.contexto_arquivo)
+                st.rerun()
+            else:
+                st.error("Formato não suportado ainda.")
+        except Exception as e:
+            st.error("Erro ao analisar o arquivo.")
+            registrar_log(f"ERRO ao ler arquivo: {str(e)}")
+    else:
+        if st.session_state.contexto_arquivo != "":
+            st.session_state.contexto_arquivo = ""
+            atualizar_metricas_contexto(st.session_state.messages, system_prompt_atual, st.session_state.contexto_arquivo)
+            st.rerun()
+
+    st.markdown("---")
+    
+    if st.button("🧹 Limpar Histórico do Chat", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.logs = []
+        st.session_state.contexto_arquivo = ""
+        atualizar_metricas_contexto([], system_prompt_atual, "")
+        st.session_state.ultimo_modelo = "N/A"
+        st.session_state.ultima_velocidade = 0.0
+        st.session_state.ultimo_tempo_total = 0.0
+        st.rerun()
+        
+    if st.button("👁️ Mostrar / Ocultar Logs Internos", use_container_width=True):
+        st.session_state.exibir_logs = not st.session_state.exibir_logs
+        st.rerun()
+
+    if st.session_state.exibir_logs:
+        st.markdown("---")
+        st.subheader("📜 Logs do Sistema")
+        if st.session_state.logs:
+            for log in st.session_state.logs:
+                st.caption(log)
+        else:
+            st.caption("Nenhum evento registrado.")
+
+# ==========================================
+# 6. TELA PRINCIPAL (INTERFACE DE CHAT)
+# ==========================================
+st.title("📊 Assistente de Dados Local/Privado")
+st.caption(f"Especialista Ativo: **{especialista_selecionado}** | Ambiente 100% Offline")
+
+if st.session_state.contexto_arquivo:
+    st.info(f"📁 **Conhecimento Ativo:** A IA carregou o mapa do documento para responder às perguntas.")
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+if prompt := st.chat_input(f"Pergunte algo para o especialista em {especialista_selecionado}..."):
+    
+    registrar_log(f"Usuário enviou pergunta: '{prompt[:30]}...'")
+    
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        status_progresso = st.status("🧠 Preparando contexto...", expanded=False)
+        resposta_placeholder = st.empty()
+        metricas_placeholder = st.empty()
+
+        try:
+            t_inicio = time.perf_counter()
+
+            prompt_sistema_final = construir_prompt_sistema_completo(system_prompt_atual, st.session_state.contexto_arquivo)
+            
+            contexto_reduzido, tokens_reais_entrada = selecionar_contexto_por_tokens(
+                st.session_state.messages, 
+                prompt_sistema_final, 
+                ORCAMENTO_CONTEXTO_MAXIMO
+            )
+            
+            t_prep = time.perf_counter() - t_inicio
+            
+            status_progresso.update(label="🤖 Consultando o modelo...", state="running")
+            t_inf_inicio = time.perf_counter()
+            
+            mensagens_chamada = [
+                {"role": "system", "content": prompt_sistema_final},
+                *contexto_reduzido
+            ]
+
+            stream_response = ollama.chat(
+                model=modelo_selecionado,
+                messages=mensagens_chamada,
+                options={"num_ctx": JANELA_CONTEXTO_PADRAO},
+                stream=True
+            )
+
+            resposta_da_ia = ""
+            tokens_saida = 0
+            ultimo_update_ui = time.perf_counter()
+
+            for chunk in stream_response:
+                if 'message' in chunk and 'content' in chunk['message']:
+                    resposta_da_ia += chunk['message']['content']
+                    
+                    agora = time.perf_counter()
+                    if agora - ultimo_update_ui > 0.1:
+                        resposta_placeholder.markdown(resposta_da_ia + " ▌")
+                        tempo_decorrido = int(agora - t_inicio)
+                        status_progresso.update(label=f"✍️ Gerando resposta... (⏱ {tempo_decorrido}s)", state="running")
+                        ultimo_update_ui = agora
+
+                if chunk.get("done"):
+                    tokens_saida = chunk.get("eval_count", 0)
+                    tokens_reais_entrada_ollama = chunk.get("prompt_eval_count", 0)
+                    if tokens_reais_entrada_ollama > 0:
+                        tokens_reais_entrada = tokens_reais_entrada_ollama
+                    if tokens_saida == 0:
+                        tokens_saida = contar_tokens(resposta_da_ia, modelo_selecionado)
+
+            t_inf = time.perf_counter() - t_inf_inicio
+
+            resposta_placeholder.markdown(resposta_da_ia)
+
+            t_pos_inicio = time.perf_counter()
+            st.session_state.messages.append({"role": "assistant", "content": resposta_da_ia})
+            t_pos = time.perf_counter() - t_pos_inicio
+
+            tempo_total = time.perf_counter() - t_inicio
+            velocidade = tokens_saida / t_inf if t_inf > 0 else 0
+
+            st.session_state.ultimo_modelo = modelo_selecionado if modelo_selecionado else "Desconhecido"
+            st.session_state.ultima_velocidade = velocidade
+            st.session_state.ultimo_tempo_total = tempo_total
+            
+            atualizar_metricas_contexto(st.session_state.messages, system_prompt_atual, st.session_state.contexto_arquivo)
+
+            status_progresso.update(label=f"✅ Resposta concluída em {tempo_total:.2f}s", state="complete")
+            
+            col1, col2, col3, col4, col5 = metricas_placeholder.columns(5)
+            col1.metric("Tempo Total", f"{tempo_total:.2f} s")
+            col2.metric("Velocidade", f"{velocidade:.1f} t/s")
+            col3.metric("Tokens Entrada", f"{tokens_reais_entrada}")
+            col4.metric("Tokens Saída", f"{tokens_saida}")
+            col5.metric("Modelo", modelo_selecionado)
+
+            log_desempenho = (
+                f"Desempenho da Inferência:\n"
+                f" - Preparação: {t_prep:.2f} s\n"
+                f" - Inferência Ollama: {t_inf:.2f} s\n"
+                f" - Pós-processamento: {t_pos:.2f} s\n"
+                f" - Tempo total: {tempo_total:.2f} s"
+            )
+            registrar_log(log_desempenho)
+            
+            st.rerun()
+
+        except Exception as e:
+            registrar_log(f"ERRO: Falha na comunicação. {str(e)}")
+            status_progresso.update(label="❌ Erro na comunicação com o modelo", state="error")
+            st.error("Falha ao conectar ao Ollama. Certifique-se de que o serviço está rodando em segundo plano.")
